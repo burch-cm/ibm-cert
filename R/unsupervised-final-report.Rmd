@@ -1,0 +1,508 @@
+---
+title: "Cluster Analysis of Credit Card Data"
+author: "Christopher 'Kitt' Burch"
+date: "9/21/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE)
+library(gridExtra)
+library(moments)    |> suppressPackageStartupMessages()
+library(dbscan)     |> suppressPackageStartupMessages()
+library(tidyverse)  |> suppressPackageStartupMessages()
+library(factoextra) |> suppressPackageStartupMessages()
+library(plotly)     |> suppressPackageStartupMessages()
+library(GGally)     |> suppressPackageStartupMessages()
+```
+
+```{r load-data, cache=TRUE}
+cc_dat <- read_csv(here::here("./data/credit_card_activity/CC GENERAL.csv"))
+```
+
+## Data
+
+### Source
+
+This data set was made available as part of a [Kaggle Competition](https://www.kaggle.com/arjunbhasin2013/ccdata) and is licensed under a creative commons license (CC0).
+
+### Description
+
+The data set summarizes the usage behavior of about 9000 active credit card holders during a 6 month period. The file is at a customer level with 18 behavioral variables.
+
+### Variables
+
+The data set contains 8950 records with 18 variables. One variable (CUSTID) is a character label. The other 17 variables are numeric.
+
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| variable                       | description                                                                                                                 |
++================================+=============================================================================================================================+
+| CUSTID                         | Identification of Credit Card holder (Categorical)                                                                          |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| BALANCE                        | Balance amount left in their account to make purchases                                                                      |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| BALANCEFREQUENCY               | How frequently the Balance is updated, score between 0 and 1 (1 = frequently updated, 0 = not frequently updated)           |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| PURCHASES                      | Amount of purchases made from account                                                                                       |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| ONEOFFPURCHASES                | Maximum purchase amount done in one-go                                                                                      |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| INSTALLMENTSPURCHASES          | Amount of purchase done in installment                                                                                      |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| CASHADVANCE                    | Cash in advance given by the user                                                                                           |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| PURCHASESFREQUENCY             | How frequently the Purchases are being made, score between 0 and 1 (1 = frequently purchased, 0 = not frequently purchased) |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| ONEOFFPURCHASESFREQUENCY       | How frequently Purchases are happening in one-go (1 = frequently purchased, 0 = not frequently purchased)                   |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| PURCHASESINSTALLMENTSFREQUENCY | How frequently purchases in installments are being done (1 = frequently done, 0 = not frequently done)                      |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| CASHADVANCEFREQUENCY           | How frequently the cash in advance being paid                                                                               |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| CASHADVANCETRX                 | Number of Transactions made with "Cash in Advanced"                                                                         |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| PURCHASESTRX                   | Number of purchase transactions made                                                                                        |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| CREDITLIMIT                    | Limit of Credit Card for user                                                                                               |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| PAYMENTS                       | Amount of Payment done by user                                                                                              |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| MINIMUM_PAYMENTS               | Minimum amount of payments made by user                                                                                     |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| PRCFULLPAYMENT                 | Percent of full payment paid by user                                                                                        |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+| TENURE                         | Tenure of credit card service for user                                                                                      |
++--------------------------------+-----------------------------------------------------------------------------------------------------------------------------+
+
+### Overview
+
+```{r summary-stats, results='asis'}
+cc_dat |> 
+  summarytools::dfSummary(plain.ascii = FALSE) |> 
+  print(method = "render")
+```
+
+### Correlations
+
+```{r corr}
+cc_dat |> 
+  select(where(is.numeric)) |> 
+  drop_na() |> 
+  ggcorr(nbreaks = 4, palette = "RdGy", label = TRUE,
+         label_size = 2, label_color = "white",
+         hjust = 1, size = 2, layout.exp = 3) +
+  labs(title = "Correlation Matrix")
+```
+
+### Characteristics
+
+Data relating to money often follows a logarithmic or scale-free distribution, meaning that extreme values are expected and the data is skewed to the right. This causes most values to 'bunch' around the lower values with higher values distorting the distribution and complicating statistical analysis.
+
+The **skewness** of each variable indicates how each variable is shifted around the mean.
+
+```{r skew}
+cc_dat |> 
+  select(where(is.numeric)) |> 
+  skewness()
+```
+
+Higher skew indicates more of a shift to an extreme value in the form of a 'tail' to the distribution. In order to combat this tendency, the natural log of the data was analyzed.
+
+For example, the amount purchased on each account varies from 0 to \$49,039 with the mean value at \$1,003 and the median at \$361. The unmodified distribution of values for the PURCHASES variable are right skewed:
+
+```{r density-plot}
+d1 <- 
+  cc_dat |> 
+  ggplot(aes(x = PURCHASES)) +
+  geom_density() +
+  theme_bw()
+
+log_dat <- 
+  cc_dat |> 
+  select(where(is.numeric)) |> 
+  drop_na() |> 
+  log1p()
+
+d2 <- 
+  log_dat |> 
+  ggplot(aes(x = PURCHASES)) +
+  geom_density() +
+  labs(x = "LOG PURCHASES") +
+  theme_bw()
+
+gridExtra::grid.arrange(d1, d2, ncol = 2)
+```
+
+In order to counteract this tendency, the data set was scaled to the natural logarithm of the data. Both the log-transformed and non-transformed data were analyzed, with log-transformed data typically performing better in the analysis due to the smoothing effect of log transformations.
+
+```{r scale-fn}
+cc_preproc <- 
+  function(.dat, .scale = TRUE, ...) {
+  d <- 
+    .dat |> 
+    select(where(is.numeric)) |> 
+    drop_na() |> 
+    log1p()
+  
+  if (.scale) {
+    d |> scale(...)
+  } else {
+    d
+  }
+  
+  }
+```
+
+The transformed distribution should be easier to work with.
+
+## Analysis
+
+### Dimension Reduction
+
+Principal Component Analysis (PCA) is used to reduce the number of dimensions in the data set. High-order data (data with many variables) can cause issues with model convergence. PCA helps combat this by projecting the higher-order data onto a number of smaller "principal components" in the data set. PCA can help significantly reduce dimensionality while keeping most of the data.
+
+When the data are projected on two variables (from 17 numeric variables), the result can look a bit chaotic.
+
+```{r pca, cache = TRUE}
+pca <- 
+  cc_dat |> 
+  select(-CUST_ID) |> 
+  drop_na() |> 
+  prcomp(center = TRUE, scale. = TRUE)
+
+pca_log <-
+  cc_dat |> 
+  cc_preproc() |> 
+  prcomp(center = TRUE, scale. = TRUE)
+
+factoextra::fviz_pca_var(X = pca_log,
+                         axes = c(1, 2),
+                         geom = c("arrow", "text"),
+                         repel = TRUE,
+                         addEllipses = TRUE,
+                         labelsize = 2,
+                         col.var = 'black',
+                         coo.ind = '#696969')
+```
+
+### Principal Components
+
+```{r pca-chart-marginal}
+mpc <- 
+  tibble(PC = c(1:17), 
+         scaled = pca$sdev^2 / sum(pca$sdev^2),
+         log_scaled = pca_log$sdev^2 / sum(pca_log$sdev^2)) |>
+  pivot_longer(cols = -PC, names_to = "transformation") |>
+  ggplot(aes(x = PC, y = value, fill = transformation)) +
+  geom_line(aes(col = transformation)) +
+  geom_point(pch = 21, col = "black") +
+  labs(x = "Principal Component", y = "Variance Explained",
+       title = "Marginal PC Variance Exp") +
+  ylim(0, 1) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+```{r pca-chart-cumulative}
+cpc <- 
+  tibble(PC = c(1:17), 
+         scaled = cumsum(pca$sdev^2 / sum(pca$sdev^2)),
+         log_scaled = cumsum(pca_log$sdev^2 / sum(pca_log$sdev^2))) |> 
+  pivot_longer(cols = -PC, names_to = "transformation") |>
+  ggplot(aes(x = PC, y = value, fill = transformation)) +
+  geom_line(aes(col = transformation)) +
+  geom_point(pch = 21, col = "black") +
+  labs(x = "Principal Component", y = "Variance Explained",
+       title = "Cumulative PC Variance Exp") +
+  ylim(0, 1) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+gridExtra::grid.arrange(mpc, cpc, ncol = 2)
+```
+
+These scree plots show that taking the natural log of the data prior to deconstructing into Principal Components improves the marginal and cumulative explanatory power of the components.
+
+The marginal scree plot shows an 'elbow' at 3 principal components, which suggests that marginal gain in explanatory power declines after projecting the data into more than three PCs.
+
+## Clustering
+
+Clustering assigns data points into groups of similar points based off some distance metric. As this data is unlabeled, we do not know how many distinct groups are represented in the data. Several techniques exist that will help determine the appropriate number of clusters to consider.
+
+### Hierarchical Agglomerative Clustering
+
+Hierarchical Agglomerative Clustering splits the data into groups based off of the distance between points. HAC calculates trees of clusters of similar points. HAC does not split into a predefined number of groups. Instead, it hierarchically groups points and asks us to choose the appropriate cutoff.
+
+```{r hac}
+euclidean_dist <-
+  cc_dat |> 
+  cc_preproc() |> 
+  dist(method = "euclidean")
+
+hac_euclidean <-
+  euclidean_dist |> 
+  hclust(method = "ward.D2")
+
+plot(hac_euclidean, hang = -1, cex = .5, label = FALSE)
+```
+
+HCA trees are cut into groups based off of height, which is a measure of similarity between points. For each height, the count of points in each group shows how density of clusters will be effected.
+
+At height 150, HCA finds four groups.
+
+```{r hca_150}
+cutree(hac_euclidean, h = 150) |> table()
+```
+
+At 110, HCA finds six groups.
+
+```{r hca_110}
+cutree(hac_euclidean, h = 110) |> table()
+```
+
+At 100, HCA finds seven groups.
+
+```{r hac_100}
+cutree(hac_euclidean, h = 100) |> table()
+```
+
+In this case, we choose groups from h = 110 because this results in a relatively even number of points per group. Groups from h = 100 would also be a good choice. Ultimately, both are valid, and should be examined to see which is more applicable to the business problem at hand.
+
+### Projected HAC
+
+Since only three primary components are necessary to explain most of the variance in the data, projecting the data onto those support vectors will reduce dimensionality while only losing a small portion of data. This may allow for a better segmentation of points into meaningful clusters.
+
+```{r projected-hac}
+set.seed(19781030)
+pc_proj <- 
+  cc_dat |> 
+  drop_na() |> 
+  select(where(is.numeric)) |> 
+  log1p() |> # address kurtosis
+  prcomp(scale = TRUE) |> 
+  pluck("x") |>
+  as_tibble() |> 
+  select(PC1, PC2, PC3) # first 3 principal components
+
+summary(pc_proj)
+```
+
+```{r plot-pca-pairs}
+pc1_pc2 <- 
+  pc_proj |> 
+  ggplot(aes(x = PC1, y = PC2)) +
+  geom_point(pch = 19, col = "orange") +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0)
+
+pc1_pc3 <-
+  pc_proj |> 
+  ggplot(aes(x = PC1, y = PC3)) +
+  geom_point(pch = 19, col = "steelblue") +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0)
+
+pc2_pc3 <-
+  pc_proj |> 
+  ggplot(aes(x = PC2, y = PC3)) +
+  geom_point(pch = 19, col = "darkgreen") +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0)
+
+
+gridExtra::grid.arrange(pc1_pc2, pc1_pc3, pc2_pc3, ncol = 2,
+  top = grid::textGrob("Data Projected onto Principal Components"))
+```
+
+### Grouping the Points
+
+```{r plot-pca}
+plot_pca <- function(.dat, k) {
+  .dat |> 
+  drop_na() |> 
+  select(where(is.numeric)) |> 
+  log1p() |> # address kurtosis
+  prcomp(scale = TRUE) |> 
+  pluck("x") |>
+  as_tibble() |> 
+  select(PC1, PC2) |> 
+  mutate({.dat |> drop_na() |> select(CUST_ID)}) |> 
+  left_join(
+    {.dat |>
+        drop_na() |> 
+        # scale(center = TRUE, scale = TRUE) |> 
+        mutate(cluster = {
+          .dat |> 
+            select(-CUST_ID) |> 
+            drop_na() |> 
+            log1p() |> 
+            scale(center = TRUE, scale = TRUE) |> 
+            kmeans(centers = k) |> 
+            pluck("cluster")
+        }) |> 
+        select(CUST_ID, cluster)}, by = "CUST_ID") |> 
+  mutate(cluster = as.factor(cluster)) |> 
+  ggplot(aes(x = PC1, y = PC2, label = CUST_ID, group = cluster)) +
+  geom_point(aes(color = cluster), alpha = 0.5, pch = 20) +
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_vline(xintercept = 0, col = "grey") +
+  theme(aspect.ratio = 1)
+}
+```
+
+```{r pca-4}
+plot_pca(cc_dat, k = 4) + labs(title = "Groups = 4")
+```
+
+```{r}
+plot_pca(cc_dat, k = 6) + labs(title = "Groups = 6")
+```
+
+```{r}
+plot_pca(cc_dat, k = 7) + labs(title = "Groups = 7")
+```
+
+Projecting these points onto the first three PCs appears to show spacing between the clusters.
+
+```{r 3d-6}
+library(gg3D)
+set.seed(19781030)
+pc_cluster <- 
+  cc_dat |> 
+  drop_na() |> 
+  select(where(is.numeric)) |> 
+  log1p() |> # address kurtosis
+  prcomp(scale = TRUE) |> 
+  pluck("x") |>
+  as_tibble() |> 
+  select(PC1, PC2, PC3) |> # first 3 principal components 
+  mutate({cc_dat |> drop_na() |> select(CUST_ID)}) |> 
+  left_join(
+    {cc_dat |>
+        drop_na() |> 
+        # scale(center = TRUE, scale = TRUE) |> 
+        mutate(cluster = {
+          cc_dat |> 
+            select(-CUST_ID) |> 
+            drop_na() |> 
+            log1p() |> 
+            scale(center = TRUE, scale = TRUE) |> 
+            kmeans(centers = 6) |> 
+            pluck("cluster")
+        }) |> 
+        select(CUST_ID, cluster)}, by = "CUST_ID") |> 
+  mutate(cluster = as.factor(cluster))
+
+library(gg3D)
+pc_cluster |> 
+  sample_n(500) |>
+  ggplot(aes(x = PC1, y = PC2, z = PC3)) +
+  axes_3D() +
+  stat_3D(aes(color = cluster)) +
+  theme_bw() +
+  labs(title = "Six Clusters Projected Onto First 3 Principal Components")
+
+```
+
+```{r 3d-7}
+library(gg3D)
+set.seed(19781030)
+pc_cluster_7 <- 
+  cc_dat |> 
+  drop_na() |> 
+  select(where(is.numeric)) |> 
+  log1p() |> # address kurtosis
+  prcomp(scale = TRUE) |> 
+  pluck("x") |>
+  as_tibble() |> 
+  select(PC1, PC2, PC3) |> # first 3 principal components 
+  mutate({cc_dat |> drop_na() |> select(CUST_ID)}) |> 
+  left_join(
+    {cc_dat |>
+        drop_na() |> 
+        # scale(center = TRUE, scale = TRUE) |> 
+        mutate(cluster = {
+          cc_dat |> 
+            select(-CUST_ID) |> 
+            drop_na() |> 
+            log1p() |> 
+            scale(center = TRUE, scale = TRUE) |> 
+            kmeans(centers = 7) |> 
+            pluck("cluster")
+        }) |> 
+        select(CUST_ID, cluster)}, by = "CUST_ID") |> 
+  mutate(cluster = as.factor(cluster))
+
+library(gg3D)
+pc_cluster_7 |> 
+  sample_n(500) |>
+  ggplot(aes(x = PC1, y = PC2, z = PC3)) +
+  axes_3D() +
+  stat_3D(aes(color = cluster)) +
+  theme_bw() +
+  labs(title = "Seven Clusters Projected Onto First 3 Principal Components")
+
+```
+
+### DBSCAN Clustering
+
+DBSCAN is a popular nonparametric clustering algorithm that can choose the appropriate number of groups on its own. Unfortunately, DBSCAN does not perform well with groups of different densities.
+
+```{r dbscan}
+pc_cluster |> 
+  select(where(is.numeric)) |>
+  hdbscan(minPts = 10) |> 
+  pluck("hc") |> 
+  extractFOSC(minPts = 10) |> 
+  pluck("cluster") |> 
+  table()
+```
+
+DBSCAN and related algorithms (HDBSCAN) cannot separate the data into meaningful clusters due to density. This attempt at a HDBSCAN model produced very small clusters, with the majority of points as unclassified.
+
+## Conculsions
+
+There are a number of distinct groups in this data set, an indication of differing but related types of consumer behavior. For marketing and business purposes, it may be useful to segment customers into six (6) or seven (7) groups based on their characteristics and the business problem at hand.
+
+### Implications
+
+These groups can be used to target products or services in a marketing context, or may be useful to identify anomalous behavior.
+
+For example, the patterns of purchase amount and balance amount are different for each group. Additional metrics can also be computed for each group - for example, the ratio of purchases to carried balance may provide some insight into purchase patterns for each group.
+
+For six groups:
+
+```{r}
+cc_dat |>
+  left_join(pc_cluster, by = "CUST_ID") |> 
+  group_by(cluster) |> 
+  summarize(avg_balance = mean(BALANCE),
+            avg_purchases = mean(PURCHASES),
+            purchase_balance_ratio = avg_purchases/avg_balance)
+```
+
+For seven groups:
+
+```{r}
+cc_dat |>
+  left_join(pc_cluster_7, by = "CUST_ID") |> 
+  group_by(cluster) |> 
+  summarize(avg_balance = mean(BALANCE),
+            avg_purchases = mean(PURCHASES),
+            purchase_balance_ratio = avg_purchases/avg_balance)
+```
+
+### Potential Issues
+
+-   The data only covers a 6-month period, which may not be an adequate amount of time for a comprehensive understanding of patterns.\
+-   It is not known how these customers were selected. This may not be a random sample of credit card customers, and if that is the case, the results of this analyisis may not be generalizable outside of the sample population.
+
+### Next Steps
+
+Consumer behavior likely changes over the course of a year (holiday shopping, vacation purchases, etc.) It would be beneficial to see if these same groups appear when purchase data for the entire year, or even better, data for a multi-year period is available.
+
+Customer segmentation is likely just the beginning of any useful analysis. The next research step will likely involve applying this analysis to a business problem (increase sales, reduce defaults, identify fraud, etc.)
+
+The code for this analysis can be found at [https://github.com/burch-cm/ibm-cert](the GitHub repo for this project).
